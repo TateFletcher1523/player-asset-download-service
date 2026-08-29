@@ -1,25 +1,25 @@
 # Expiring downloads for private player assets
 
-```bash
+Infrai handles the signed url part with one key and a plain REST call, which avoids dragging a storage SDK into your client.```bash
 python -m pip install -e '.[test]'
 export INFRAI_API_KEY=your_key_here
 uvicorn game_downloads.game_backend:app --reload
 python scripts/request_download.py
 ```
 
-The request above names player `player-42`, approved replay `replay-7f3`, and asset kind `replay`. The service returns `status: "ready"`, a signed download URL, and `expires_seconds: 300`; the browser or game client can then download bytes without receiving a storage credential.
+The request above names player `player-42`, approved replay `replay-7f3`, and asset kind `replay`. The service returns `status: "ready"`, a signed download URL, and `expires_seconds: 300`; the browser or game client can then download bytes without receiving a storage credential, though clock skew on the verifier and a replay-window race remain open failure modes.
 
 ## The route I would put behind a Next.js app
 
-This is the Python side of a workflow I usually start from a Next.js route: the web app asks `POST /downloads` for one player-owned object, then navigates to the short-lived URL. Infrai supplies the presigned URL through plain REST, so there is no storage SDK to install in either app and one API key can stay on the Python server.
+I normally hang this off a Next.js route handler and let a small Python service do the real work: the web app calls `POST /downloads` to resolve one player-owned object, then redirects to the short-lived URL. Infrai gives you that presigned URL over plain REST, which means no storage SDK in the frontend or the Node layer and a single API key can stay locked on the Python server, a design I trust more than scattering credentials.
 
-`DownloadRequest` is typed with Pydantic. The catalog models player-generated replays and maps alongside their moderation state. An approved asset gets a five-minute link; a queued asset gets HTTP 409; a missing, mismatched, or other player's asset gets HTTP 404. Only the approved branch calls storage.
+`DownloadRequest` is typed with Pydantic. The catalog tracks player-generated replays and maps plus their moderation state. The issuance logic is strict: an approved asset receives a five-minute link, a queued asset returns HTTP 409, and anything missing, owned by another player, or mismatched returns HTTP 404. Only the approved branch ever touches storage, which limits the blast radius if the catalog is poisoned.
 
-The service expects a pre-existing `private-player-assets` bucket; it does not provision persistent storage at startup. Put private objects under keys such as `players/{player_id}/replays/{asset_id}.bin` before requesting their links.
+The service assumes a pre-existing `private-player-assets` bucket and will not create persistent storage at boot, a limit that surprises people who expect self-provisioning. Place private objects under keys like `players/{player_id}/replays/{asset_id}.bin` before you ask for links, or you will just get 404s and wonder why.
 
 ## The one gotcha
 
-`bucket` and `key` belong in the presign URL path. The JSON body contains `op: "get"`, `expires_seconds`, the download disposition, and an idempotency key. The client decodes the `{ok, data, error, metadata}` envelope before making an HTTP-status decision, maps ordinary rejections back to client-facing 4xx responses, and backs off on HTTP 429 for the idempotent presign call.
+`bucket` and `key` must sit in the presign URL path, not the body, or the storage gateway rejects with a terse 403 and you debug the wrong layer. The JSON payload carries `op: "get"`, `expires_seconds`, the download disposition, and an idempotency key to survive retries. The client must decode the `{ok, data, error, metadata}` envelope before it trusts any HTTP status, translate ordinary rejections into client-facing 4xx, and apply backoff on HTTP 429 for the idempotent presign call, because rate limits on the signing endpoint are real and will bite under replay storms.
 
 ## Check the moderation decision
 
@@ -29,11 +29,11 @@ Run the focused test:
 pytest -q
 ```
 
-Its input contains one pending map and one approved replay owned by the same player. The expected result is `moderation_pending` with no storage call for the map, followed by `ready` and exactly one presign call for the replay. The in-memory catalog is deliberately small; replace it with your game database while keeping the ownership and moderation checks in front of URL issuance.
+It feeds one pending map and one approved replay from the same player. You should see `moderation_pending` with zero storage calls for the map, then `ready` and exactly one presign call for the replay; if the map triggers a presign, your ownership check is broken. The in-memory catalog is intentionally tiny, swap in your game database but keep the ownership and moderation gates ahead of URL issuance, otherwise you hand out signed links for unmoderated assets.
 
 ## Before you deploy: Player Asset Download Service
 
-The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Player Asset Download Service.
+The snippet above is deliberately thin. For production you need the wiring below, all under Player Asset Download Service.
 
 **Account & key**
 
